@@ -1,6 +1,6 @@
 <component name="ArtifactManager">
   <artifact type="jar" name="lob-factor:jar">
-    <output-path>$PROJECT_DIR$/out/artifacts/lob_factor_jar</output-path>
+    <output-path>$PROJECT_DIR$/</output-path>
     <root id="archive" name="lob-factor.jar">
       <element id="module-output" name="lob-factor" />
       <element id="extracted-dir" path="$MAVEN_REPOSITORY$/org/apache/hadoop/hadoop-mapreduce-client-jobclient/3.4.1/hadoop-mapreduce-client-jobclient-3.4.1.jar" path-in-jar="/" />
@@ -13,7 +13,7 @@
       <element id="extracted-dir" path="$MAVEN_REPOSITORY$/org/apache/commons/commons-text/1.10.0/commons-text-1.10.0.jar" path-in-jar="/" />
       <element id="extracted-dir" path="$MAVEN_REPOSITORY$/org/apache/commons/commons-compress/1.26.1/commons-compress-1.26.1.jar" path-in-jar="/" />
       <element id="extracted-dir" path="$MAVEN_REPOSITORY$/org/eclipse/jetty/jetty-http/9.4.53.v20231009/jetty-http-9.4.53.v20231009.jar" path-in-jar="/" />
-      <element id="extracted-dir" path="$USER_HOME$/software/jdk1.8.0_451/lib/tools.jar" path-in-jar="/" />
+      <element id="extracted-dir" path="$PROJECT_DIR$/../software/jdk1.8.0_451/lib/tools.jar" path-in-jar="/" />
       <element id="extracted-dir" path="$MAVEN_REPOSITORY$/org/apache/kerby/kerby-asn1/2.0.3/kerby-asn1-2.0.3.jar" path-in-jar="/" />
       <element id="extracted-dir" path="$MAVEN_REPOSITORY$/io/netty/netty-transport-rxtx/4.1.100.Final/netty-transport-rxtx-4.1.100.Final.jar" path-in-jar="/" />
       <element id="extracted-dir" path="$MAVEN_REPOSITORY$/commons-beanutils/commons-beanutils/1.9.4/commons-beanutils-1.9.4.jar" path-in-jar="/" />
