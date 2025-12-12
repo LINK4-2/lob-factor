@@ -73,36 +73,31 @@ public class LobFactorJob {
     // 2) 不需要把每只股票每一行的 20 因子都发到 reducer
     public static class FactorMapper extends Mapper<LongWritable, Text, Text, Text> {
 
-        // 记录每支股票上一时刻状态（用于 17/18/19）
-        private final Map<String, PrevState> prevMap = new HashMap<>();
+        // ✅ 性能测试时建议关闭（每行 Counter.increment 会拖慢）。把它
+        private static final boolean DEBUG = true;
 
-        // ✅ 核心优化：tradeTime -> 聚合器 Agg(sum[20], count)
-        // 原来是：每行直接输出 20 个因子字符串
-        // 现在是：同一个 tradeTime 的多行先累加到 Agg 里，避免大量 context.write
+        // ✅ code 用 int，避免 substring 得到新 String（同时也更省内存）
+        private final Map<Integer, PrevState> prevMap = new HashMap<>(512);
+
+        // ✅ tradeTime -> 聚合(sum[20], count)
         private final Map<String, Agg> aggMap = new HashMap<>(8192);
 
-        // Text 对象复用，避免频繁 new Text 造成 GC 压力
         private final Text outKey = new Text();
         private final Text outVal = new Text();
 
-        // factor 数组复用：每行都写入同一个 double[20]，避免每行 new double[20]
-        // 注意：因为我们在 Agg.add() 中“把数值加到 sum 里”，不会引用 factor 数组本身，
-        //       所以复用是安全的。
+        // ✅ 复用 factor 数组：每行填充一次，Agg.add 时把数值加到 sum 里即可
         private final double[] factor = new double[20];
 
-        // ✅ 聚合器：保存同一 tradeTime 下的 20 因子总和 + 样本数
         private static class Agg {
             final double[] sum = new double[20];
             long count = 0;
 
-            //  每读一行快照，只把 20 个因子“加到 sum”，并 count++
             void add(double[] f) {
+                // ✅ 只做 20 次加法，不产生新对象
                 for (int i = 0; i < 20; i++) sum[i] += f[i];
                 count++;
             }
 
-            // ✅ 输出给 reducer 的 value：sum0,sum1,...,sum19,count
-            // Reducer 再把不同 mapper 的 sum/count 合并即可，不再需要每行的因子明细
             String toCsvSumAndCount() {
                 // 输出：sum0,sum1,...,sum19,count
                 StringBuilder sb = new StringBuilder(20 * 12);
@@ -120,70 +115,99 @@ public class LobFactorJob {
                 throws IOException, InterruptedException {
 
             String line = value.toString();
-            if (line == null) return;
-            line = line.trim();
-            if (line.isEmpty()) return;
+            if (line == null || line.isEmpty()) return;
 
-            // 跳过表头
-            if (line.startsWith("tradingDay")) return;
+            // ✅ 比 startsWith("tradingDay") 更快：表头第一列一定是 't'
+            if (line.charAt(0) == 't') return;
 
-            // 仍用 split（优化重点是“减少输出条数”；如果你还想更快，下一步再换手写解析）
-            String[] f = line.split(",");
-            if (f.length < 57) return;
+            // ===========================
+            // ✅ 核心优化 1：不用 split(",")
+            //  - String.split 是正则，会创建大量 String 对象，CPU + GC 都贵
+            //  - 我们只需要有限的列，所以用扫描逗号的方式只解析需要的字段
+            // ===========================
 
-            String tradeTimeStr = f[1];
-            String code = f[4];
+            int hms = 0;          // col 1
+            int code = 0;         // col 4
+            double tBidVol = 0;   // col 12
+            double tAskVol = 0;   // col 13
 
-            double tBidVol = Double.parseDouble(f[12]);
-            double tAskVol = Double.parseDouble(f[13]);
-
-            int idx = 17;
-            double[] bp = new double[N];
-            double[] bv = new double[N];
-            double[] ap = new double[N];
-            double[] av = new double[N];
-            for (int i = 0; i < N; i++) {
-                bp[i] = Double.parseDouble(f[idx++]);
-                bv[i] = Double.parseDouble(f[idx++]);
-                ap[i] = Double.parseDouble(f[idx++]);
-                av[i] = Double.parseDouble(f[idx++]);
-            }
-
-            // tradeTime 处理（假设已是 hhmmss；若你的数据带后缀，需要你自己恢复砍位逻辑）
-            int hms = (int) Long.parseLong(tradeTimeStr);
-
-            // 仅输出 09:30~15:00；早盘用于初始化 prev
-            boolean inOutputWindow = (hms >= 93000 && hms <= 150000);
-
-            double ap1 = ap[0];
-            double bp1 = bp[0];
-            double bv1 = bv[0];
-            double av1 = av[0];
-
+            // 下面这些是从 bp1..av5 直接累计出来的（不再 new 数组）
+            double bp1 = 0, bv1 = 0, ap1 = 0, av1 = 0;
             double sumBv = 0, sumAv = 0;
             double sumBpBv = 0, sumApAv = 0;
             double sumBvOverI = 0, sumAvOverI = 0;
 
-            for (int i = 0; i < N; i++) {
-                int level = i + 1;
-                double bv_i = bv[i], av_i = av[i];
-                double bp_i = bp[i], ap_i = ap[i];
+            // 当前档位的临时 bp / ap（因为列顺序是 bp,bv,ap,av）
+            double curBp = 0, curAp = 0;
 
-                sumBv += bv_i;
-                sumAv += av_i;
-                sumBpBv += bp_i * bv_i;
-                sumApAv += ap_i * av_i;
-                sumBvOverI += bv_i / level;
-                sumAvOverI += av_i / level;
+            int col = 0;
+            int start = 0;
+            final int len = line.length();
+
+            // 扫描到 bp1..av5 就够了：列 17~36
+            for (int i = 0; i <= len; i++) {
+                if (i == len || line.charAt(i) == ',') {
+                    int end = i;
+
+                    if (col == 1) {
+                        // tradeTime（6 位 hhmmss）
+                        hms = parseIntFast(line, start, end);
+                    } else if (col == 4) {
+                        // code（你数据里是数字：1 / 2 / ...）
+                        code = parseIntFast(line, start, end);
+                    } else if (col == 12) {
+                        tBidVol = parseDoubleFast(line, start, end);
+                    } else if (col == 13) {
+                        tAskVol = parseDoubleFast(line, start, end);
+                    } else if (col >= 17 && col <= 36) {
+                        // ✅ 只解析前 5 档（bp1,bv1,ap1,av1,...,bp5,bv5,ap5,av5）
+                        int k = col - 17;       // 0..19
+                        int level = k / 4 + 1;  // 1..5
+                        int pos = k & 3;        // 0 bp, 1 bv, 2 ap, 3 av
+
+                        double v = parseDoubleFast(line, start, end);
+
+                        if (pos == 0) { // bp
+                            curBp = v;
+                            if (level == 1) bp1 = v;
+                        } else if (pos == 1) { // bv
+                            double bv = v;
+                            if (level == 1) bv1 = bv;
+                            sumBv += bv;
+                            sumBpBv += curBp * bv;
+                            sumBvOverI += bv / level;
+                        } else if (pos == 2) { // ap
+                            curAp = v;
+                            if (level == 1) ap1 = v;
+                        } else { // av
+                            double av = v;
+                            if (level == 1) av1 = av;
+                            sumAv += av;
+                            sumApAv += curAp * av;
+                            sumAvOverI += av / level;
+                        }
+                    }
+
+                    col++;
+                    start = i + 1;
+
+                    // ✅ 解析到 av5 就停止（col==37 表示已经处理完 0..36）
+                    if (col > 36) break;
+                }
             }
 
+            // 如果列不够，直接丢弃
+            if (col <= 36) return;
+
+            // 输出窗口：9:30:00 ~ 15:00:00（09:25 用于初始化 prev）
+            boolean inOutputWindow = (hms >= 93000 && hms <= 150000);
+
             double depthSum = sumBv + sumAv;
-            double depthDiff = sumBv - sumAv;
             double depthRatio = safeDiv(sumBv, sumAv);
             double spread = ap1 - bp1;
             double mid = (ap1 + bp1) / 2.0;
 
-            // ---- 1~16（当前时刻）----
+            // ========== 1~16（当前时刻） ==========
             factor[0]  = spread;
             factor[1]  = safeDiv(spread, mid);
             factor[2]  = mid;
@@ -191,7 +215,7 @@ public class LobFactorJob {
             factor[4]  = safeDiv(sumBv - sumAv, depthSum);
             factor[5]  = sumBv;
             factor[6]  = sumAv;
-            factor[7]  = depthDiff;
+            factor[7]  = (sumBv - sumAv);
             factor[8]  = depthRatio;
             factor[9]  = safeDiv(tBidVol - tAskVol, tBidVol + tAskVol);
             factor[10] = safeDiv(sumBpBv, sumBv);
@@ -201,7 +225,7 @@ public class LobFactorJob {
             factor[14] = (sumBv / N) - (sumAv / N);
             factor[15] = safeDiv(sumBvOverI - sumAvOverI, sumBvOverI + sumAvOverI);
 
-            // ---- 17~19（上一时刻）----
+            // ========== 17~19（上一时刻） ==========
             PrevState ps = prevMap.get(code);
             double prevAp1, prevMid, prevDepthRatio;
             if (ps == null) {
@@ -221,18 +245,15 @@ public class LobFactorJob {
             // 20
             factor[19] = safeDiv(spread, depthSum);
 
-            // 更新 prev 状态
+            // 更新 prev
             prevMap.put(code, new PrevState(ap1, bp1, mid, depthRatio));
 
-            // 09:30~15:00 之外不输出
+            // 09:30~15:00 之外不输出（只更新 prev）
             if (!inOutputWindow) return;
 
-            // 生成固定 6 位 tradeTime key（避免 String.format 的开销）
             String timeKey = pad6(hms);
 
-            // ✅ 核心优化：in-mapper aggregation
-            // 不再 context.write(timeKey, factorCsv)
-            // 而是把因子加到 aggMap 里
+            // ✅ 核心优化 2：in-mapper aggregation（你已经验证能把 MAP_OUTPUT_RECORDS 降到 4802）
             Agg agg = aggMap.get(timeKey);
             if (agg == null) {
                 agg = new Agg();
@@ -240,42 +261,82 @@ public class LobFactorJob {
             }
             agg.add(factor);
 
-            // ✅（调试用）统计窗口内处理了多少行
-            // 性能测试时建议关掉（每行 increment 会有开销）
-            context.getCounter("DBG", "IN_WINDOW_LINES").increment(1);
-
+            if (DEBUG) context.getCounter("DBG", "IN_WINDOW_LINES").increment(1);
         }
 
         @Override
         protected void cleanup(Context context) throws IOException, InterruptedException {
-            // ✅ cleanup() 在一个 Mapper 结束时调用一次
-            // 这里一次性把“每个 tradeTime 的 sum/count”输出，输出条数≈时间点数（几千）
-            // 这就是 MAP_OUTPUT_RECORDS 大幅下降的原因
+            if (DEBUG) context.getCounter("DBG", "EMITTED_TIME_KEYS").increment(aggMap.size());
 
-            // ✅（调试用）输出的 tradeTime key 数量（也就是 aggMap.size()）
-            context.getCounter("DBG", "EMITTED_TIME_KEYS").increment(aggMap.size());
             for (Map.Entry<String, Agg> e : aggMap.entrySet()) {
                 outKey.set(e.getKey());
                 outVal.set(e.getValue().toCsvSumAndCount());
                 context.write(outKey, outVal);
             }
-            // 释放引用，帮助 GC（local 模式下也能略减内存压力）
+
             aggMap.clear();
             prevMap.clear();
         }
 
         private static String pad6(int hms) {
-            // hms 形如 93000 -> "093000"
             String s = Integer.toString(hms);
             int n = s.length();
             if (n >= 6) return s;
-            // 手动补 0，比 String.format 快
             StringBuilder sb = new StringBuilder(6);
             for (int i = 0; i < 6 - n; i++) sb.append('0');
             sb.append(s);
             return sb.toString();
         }
+
+        // ===========================
+        // ✅ 解析工具：避免 substring + Double.parseDouble 的大量对象创建
+        // 数据里基本是整数（价格/量），这里实现一个“切片解析数字”
+        // 如遇到小数点，也支持解析（但更慢一点）
+        // ===========================
+
+        private static int parseIntFast(String s, int start, int end) {
+            int i = start;
+            boolean neg = false;
+            if (i < end && s.charAt(i) == '-') { neg = true; i++; }
+
+            int v = 0;
+            for (; i < end; i++) {
+                char c = s.charAt(i);
+                v = v * 10 + (c - '0');
+            }
+            return neg ? -v : v;
+        }
+
+        private static double parseDoubleFast(String s, int start, int end) {
+            int i = start;
+            boolean neg = false;
+            if (i < end && s.charAt(i) == '-') { neg = true; i++; }
+
+            long intPart = 0;
+            long fracPart = 0;
+            long fracDiv = 1;
+            boolean frac = false;
+
+            for (; i < end; i++) {
+                char c = s.charAt(i);
+                if (c == '.') {
+                    frac = true;
+                    continue;
+                }
+                int d = c - '0';
+                if (!frac) {
+                    intPart = intPart * 10 + d;
+                } else {
+                    fracPart = fracPart * 10 + d;
+                    fracDiv *= 10;
+                }
+            }
+
+            double v = (double) intPart + (frac ? (fracPart / (double) fracDiv) : 0.0);
+            return neg ? -v : v;
+        }
     }
+
 
 
     // ======================  Reducer  ======================
