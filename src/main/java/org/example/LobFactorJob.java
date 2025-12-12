@@ -11,6 +11,8 @@ import org.apache.hadoop.mapreduce.TaskCounter;
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 
+import org.apache.hadoop.mapreduce.lib.input.CombineTextInputFormat;
+
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
@@ -61,104 +63,111 @@ public class LobFactorJob {
     }
 
     // ======================  Mapper  ======================
-    /**
-     * Mapper 输入：
-     *   Key: LongWritable —— 当前行在文件中的偏移量
-     *   Value: Text —— 一行 CSV 文本
-     *
-     * Mapper 输出：
-     *   Key: Text —— tradeTime（格式化为 6 位：093000）
-     *   Value: Text —— 20 个因子用逗号拼起来的字符串（CSV）
-     *
-     * Reducer 会按 Key（tradeTime）把所有股票同一时刻的因子聚在一起做平均。
-     */
+    // ✅ 优化目标：减少 Map -> Reduce 的中间输出数量（MAP_OUTPUT_RECORDS）
+    // 原始版本：每读取一行快照就 context.write 一条  (≈ 144 万条)
+    // 优化版本：在 Mapper 内部先按 tradeTime 聚合(sum+count)，最后在 cleanup() 统一输出
+    //          => MAP_OUTPUT_RECORDS 从百万级降到“时间点数量”（你实测 4802）
+    //
+    // ✅ 为什么有效：
+    // 1) 横截面平均只需要每个 tradeTime 的“总和 + 个数”
+    // 2) 不需要把每只股票每一行的 20 因子都发到 reducer
     public static class FactorMapper extends Mapper<LongWritable, Text, Text, Text> {
 
-        // code -> 上一时刻状态（300 个文件，每个 code 只在一个文件里）
+        // 记录每支股票上一时刻状态（用于 17/18/19）
         private final Map<String, PrevState> prevMap = new HashMap<>();
 
-        // 复用 Text 对象，减少 GC (Garbage Collection) 压力（MR 里是常用优化）
+        // ✅ 核心优化：tradeTime -> 聚合器 Agg(sum[20], count)
+        // 原来是：每行直接输出 20 个因子字符串
+        // 现在是：同一个 tradeTime 的多行先累加到 Agg 里，避免大量 context.write
+        private final Map<String, Agg> aggMap = new HashMap<>(8192);
+
+        // Text 对象复用，避免频繁 new Text 造成 GC 压力
         private final Text outKey = new Text();
         private final Text outVal = new Text();
+
+        // factor 数组复用：每行都写入同一个 double[20]，避免每行 new double[20]
+        // 注意：因为我们在 Agg.add() 中“把数值加到 sum 里”，不会引用 factor 数组本身，
+        //       所以复用是安全的。
+        private final double[] factor = new double[20];
+
+        // ✅ 聚合器：保存同一 tradeTime 下的 20 因子总和 + 样本数
+        private static class Agg {
+            final double[] sum = new double[20];
+            long count = 0;
+
+            //  每读一行快照，只把 20 个因子“加到 sum”，并 count++
+            void add(double[] f) {
+                for (int i = 0; i < 20; i++) sum[i] += f[i];
+                count++;
+            }
+
+            // ✅ 输出给 reducer 的 value：sum0,sum1,...,sum19,count
+            // Reducer 再把不同 mapper 的 sum/count 合并即可，不再需要每行的因子明细
+            String toCsvSumAndCount() {
+                // 输出：sum0,sum1,...,sum19,count
+                StringBuilder sb = new StringBuilder(20 * 12);
+                for (int i = 0; i < 20; i++) {
+                    if (i > 0) sb.append(',');
+                    sb.append(sum[i]);
+                }
+                sb.append(',').append(count);
+                return sb.toString();
+            }
+        }
 
         @Override
         protected void map(LongWritable key, Text value, Context context)
                 throws IOException, InterruptedException {
 
-            /* ========== 1) 读一行、做基本过滤 ========== */
-
-            String line = value.toString().trim();
+            String line = value.toString();
+            if (line == null) return;
+            line = line.trim();
             if (line.isEmpty()) return;
 
-            // 每个文件第一行都是表头，从 "tradingDay" 开头，直接跳过
-            if (line.startsWith("tradingDay")) {
-                return;
-            }
+            // 跳过表头
+            if (line.startsWith("tradingDay")) return;
 
-            // 数据是 CSV，用逗号分隔（和 snapshot.csv / 0102.csv 一样）
+            // 仍用 split（优化重点是“减少输出条数”；如果你还想更快，下一步再换手写解析）
             String[] f = line.split(",");
+            if (f.length < 57) return;
 
-            // 安全起见，长度太短的行丢弃（真实数据会比 57 列多）
-            if (f.length < 57) {
-                return;
-            }
+            String tradeTimeStr = f[1];
+            String code = f[4];
 
-            /* ========== 2) 预处理：只取需要列（过滤无用列） ========== */
+            double tBidVol = Double.parseDouble(f[12]);
+            double tAskVol = Double.parseDouble(f[13]);
 
-            String tradeTimeStr = f[1]; // tradeTime
-            String code         = f[4]; // code
-
-            // 全市场买/卖总量
-            double tBidVol = Double.parseDouble(f[12]); // tBidVol
-            double tAskVol = Double.parseDouble(f[13]); // tAskVol
-
-            // 从 17 开始是 bp1,bv1,ap1,av1,...,bp10,bv10,ap10,av10
             int idx = 17;
             double[] bp = new double[N];
             double[] bv = new double[N];
             double[] ap = new double[N];
             double[] av = new double[N];
-            for (int i = 0; i < N; i++) {      // N = 5，只用前五档
-                bp[i] = Double.parseDouble(f[idx++]); // bp1,bp2,...
-                bv[i] = Double.parseDouble(f[idx++]); // bv1,bv2,...
-                ap[i] = Double.parseDouble(f[idx++]); // ap1,ap2,...
-                av[i] = Double.parseDouble(f[idx++]); // av1,av2,...
+            for (int i = 0; i < N; i++) {
+                bp[i] = Double.parseDouble(f[idx++]);
+                bv[i] = Double.parseDouble(f[idx++]);
+                ap[i] = Double.parseDouble(f[idx++]);
+                av[i] = Double.parseDouble(f[idx++]);
             }
-            // 后面的 bp6..bp10 等列我们完全忽略，相当于“过滤掉无用列”
 
-            /* ========== 3) 处理 tradeTime 格式：hmmssffffffff -> hhmmss. 输出按 hhmmss 聚合 ========== */
+            // tradeTime 处理（假设已是 hhmmss；若你的数据带后缀，需要你自己恢复砍位逻辑）
+            int hms = (int) Long.parseLong(tradeTimeStr);
 
-            long tradeTimeRaw = Long.parseLong(tradeTimeStr);
-            int hms;
-//            if (tradeTimeStr.length() > 6) {
-//                // hmmssffffffff，砍掉后 8 位
-//                hms = (int) (tradeTimeRaw / 100000000L);
-//            } else {
-            hms = (int) tradeTimeRaw;
-//            }
-
-            // 输出窗口：9:30:00 ~ 15:00:00（11:30~13:00 中间本来就没数据）
+            // 仅输出 09:30~15:00；早盘用于初始化 prev
             boolean inOutputWindow = (hms >= 93000 && hms <= 150000);
 
-            /* ========== 4) 计算当前时刻的各种聚合量（用于多个因子复用） ========== */
-
-            // 最优一档（买一/卖一）及对应量
             double ap1 = ap[0];
             double bp1 = bp[0];
             double bv1 = bv[0];
             double av1 = av[0];
 
-            // 多档合计：深度、加权价格、衰减权重等
-            double sumBv = 0, sumAv = 0;            // 买/卖深度（数量合计）
-            double sumBpBv = 0, sumApAv = 0;        // VWAP 分子：Σ(price * volume)
-            double sumBvOverI = 0, sumAvOverI = 0;  // 16 因子：按档位衰减 Σ(volume / level)
+            double sumBv = 0, sumAv = 0;
+            double sumBpBv = 0, sumApAv = 0;
+            double sumBvOverI = 0, sumAvOverI = 0;
 
             for (int i = 0; i < N; i++) {
                 int level = i + 1;
-                double bv_i = bv[i];
-                double av_i = av[i];
-                double bp_i = bp[i];
-                double ap_i = ap[i];
+                double bv_i = bv[i], av_i = av[i];
+                double bp_i = bp[i], ap_i = ap[i];
 
                 sumBv += bv_i;
                 sumAv += av_i;
@@ -168,118 +177,112 @@ public class LobFactorJob {
                 sumAvOverI += av_i / level;
             }
 
-            // 深度相关派生量
-            double depthSum   = sumBv + sumAv;          //总深度
-            double depthDiff  = sumBv - sumAv;          //深度差
-            double depthRatio = safeDiv(sumBv, sumAv);  //深度比（用safeDiv）
-            double spread     = ap1 - bp1;              //最优价差
-            double mid        = (ap1 + bp1) / 2.0;      //中间价
+            double depthSum = sumBv + sumAv;
+            double depthDiff = sumBv - sumAv;
+            double depthRatio = safeDiv(sumBv, sumAv);
+            double spread = ap1 - bp1;
+            double mid = (ap1 + bp1) / 2.0;
 
-            // 20 个因子数组（factor[0] 对应 alpha_1）
-            double[] factor = new double[20];
-
-            /* ========== 5) 因子 1~16：只依赖当前时刻 ========== */
-
-            // 1 最优价差
-            factor[0] = spread;
-            // 2 相对价差 = spread / mid
-            factor[1] = safeDiv(spread, mid);
-            // 3 中间价
-            factor[2] = mid;
-            // 4 买一不平衡 (bv1 - av1) / (bv1 + av1)
-            factor[3] = safeDiv(bv1 - av1, bv1 + av1);
-            // 5 多档不平衡 (sumBv - sumAv) / (sumBv + sumAv)
-            factor[4] = safeDiv(sumBv - sumAv, depthSum);
-            // 6 买方深度
-            factor[5] = sumBv;
-            // 7 卖方深度
-            factor[6] = sumAv;
-            // 8 深度差
-            factor[7] = depthDiff;
-            // 9 深度比
-            factor[8] = depthRatio;
-            // 10 全市场买卖总量平衡指标 (tBidVol - tAskVol)/(tBidVol + tAskVol)
-            factor[9] = safeDiv(tBidVol - tAskVol, tBidVol + tAskVol);
-            // 11 VWAPBid = Σ(bp_i*bv_i) / Σ(bv_i)
+            // ---- 1~16（当前时刻）----
+            factor[0]  = spread;
+            factor[1]  = safeDiv(spread, mid);
+            factor[2]  = mid;
+            factor[3]  = safeDiv(bv1 - av1, bv1 + av1);
+            factor[4]  = safeDiv(sumBv - sumAv, depthSum);
+            factor[5]  = sumBv;
+            factor[6]  = sumAv;
+            factor[7]  = depthDiff;
+            factor[8]  = depthRatio;
+            factor[9]  = safeDiv(tBidVol - tAskVol, tBidVol + tAskVol);
             factor[10] = safeDiv(sumBpBv, sumBv);
-            // 12 VWAPAsk = Σ(ap_i*av_i) / Σ(av_i)
             factor[11] = safeDiv(sumApAv, sumAv);
-            // 13 加权中间价 = (Σ(bp_i*bv_i) + Σ(ap_i*av_i)) / (sumBv + sumAv)
             factor[12] = safeDiv(sumBpBv + sumApAv, depthSum);
-            // 14 加权价差 = VWAPAsk - VWAPBid
             factor[13] = factor[11] - factor[10];
-            // 15 买卖深度的密度差：平均每档深度差 (sumBv/N - sumAv/N)
             factor[14] = (sumBv / N) - (sumAv / N);
-            // 16 按档位衰减的不对称度： (Σ(bv_i/i) - Σ(av_i/i)) / (Σ(bv_i/i) + Σ(av_i/i))
-            double num16 = sumBvOverI - sumAvOverI;
-            double den16 = sumBvOverI + sumAvOverI;
-            factor[15] = safeDiv(num16, den16);
+            factor[15] = safeDiv(sumBvOverI - sumAvOverI, sumBvOverI + sumAvOverI);
 
-            /* ========== 6) 因子 17~19：需要上一时刻 ========== */
-
+            // ---- 17~19（上一时刻）----
             PrevState ps = prevMap.get(code);
-            double prevAp1, prevBp1, prevMid, prevDepthRatio;
+            double prevAp1, prevMid, prevDepthRatio;
             if (ps == null) {
-                // 第一条就用自己当“上一条”，变化量为 0
                 prevAp1 = ap1;
-                prevBp1 = bp1;
                 prevMid = mid;
                 prevDepthRatio = depthRatio;
             } else {
                 prevAp1 = ps.ap1;
-                prevBp1 = ps.bp1;
                 prevMid = ps.mid;
                 prevDepthRatio = ps.depthRatio;
             }
 
-            // 17 最优价变动：ap1 - prevAp1
             factor[16] = ap1 - prevAp1;
-            // 18 中间价变动：mid - prevMid
             factor[17] = mid - prevMid;
-            // 19 深度比变动：depthRatio - prevDepthRatio
             factor[18] = depthRatio - prevDepthRatio;
-            // 20 价压指标：spread / (sumBv + sumAv)
+
+            // 20
             factor[19] = safeDiv(spread, depthSum);
 
-            // 更新该股票的上一时刻状态
+            // 更新 prev 状态
             prevMap.put(code, new PrevState(ap1, bp1, mid, depthRatio));
 
-            // 只对 09:30~15:00 输出，09:25 的数据只用来初始化 prev 状态
+            // 09:30~15:00 之外不输出
             if (!inOutputWindow) return;
 
-            // tradeTime 输出格式：固定 6 位，例如 093000
-            String timeKey = String.format("%06d", hms);
+            // 生成固定 6 位 tradeTime key（避免 String.format 的开销）
+            String timeKey = pad6(hms);
 
-            outKey.set(timeKey);
-            outVal.set(factorsToCsv(factor)); // value 是 20 个因子 CSV
-            context.write(outKey, outVal);
+            // ✅ 核心优化：in-mapper aggregation
+            // 不再 context.write(timeKey, factorCsv)
+            // 而是把因子加到 aggMap 里
+            Agg agg = aggMap.get(timeKey);
+            if (agg == null) {
+                agg = new Agg();
+                aggMap.put(timeKey, agg);
+            }
+            agg.add(factor);
+
+            // ✅（调试用）统计窗口内处理了多少行
+            // 性能测试时建议关掉（每行 increment 会有开销）
+            context.getCounter("DBG", "IN_WINDOW_LINES").increment(1);
+
         }
 
-        /**
-         * 把 double[20] 转成 "f1,f2,...,f20"
-         * Reducer 会再 split 回来求和求平均
-         */
-        private static String factorsToCsv(double[] f) {
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < f.length; i++) {
-                if (i > 0) sb.append(',');
-                sb.append(f[i]);
+        @Override
+        protected void cleanup(Context context) throws IOException, InterruptedException {
+            // ✅ cleanup() 在一个 Mapper 结束时调用一次
+            // 这里一次性把“每个 tradeTime 的 sum/count”输出，输出条数≈时间点数（几千）
+            // 这就是 MAP_OUTPUT_RECORDS 大幅下降的原因
+
+            // ✅（调试用）输出的 tradeTime key 数量（也就是 aggMap.size()）
+            context.getCounter("DBG", "EMITTED_TIME_KEYS").increment(aggMap.size());
+            for (Map.Entry<String, Agg> e : aggMap.entrySet()) {
+                outKey.set(e.getKey());
+                outVal.set(e.getValue().toCsvSumAndCount());
+                context.write(outKey, outVal);
             }
+            // 释放引用，帮助 GC（local 模式下也能略减内存压力）
+            aggMap.clear();
+            prevMap.clear();
+        }
+
+        private static String pad6(int hms) {
+            // hms 形如 93000 -> "093000"
+            String s = Integer.toString(hms);
+            int n = s.length();
+            if (n >= 6) return s;
+            // 手动补 0，比 String.format 快
+            StringBuilder sb = new StringBuilder(6);
+            for (int i = 0; i < 6 - n; i++) sb.append('0');
+            sb.append(s);
             return sb.toString();
         }
     }
 
-    // ======================  Reducer  ======================
-    /**
-     * Reducer 输入：
-     *   Key: tradeTime（093000）
-     *   Values: 该时刻所有股票（最多 300 个）的 20 因子字符串
-     *
-     * Reducer 输出：
-     *   Key: tradeTime
-     *   Value: 平均后的 20 因子字符串
-     */
 
+    // ======================  Reducer  ======================
+    // ✅ Reducer 输入从“每行 20 因子”变成 “每个 mapper 在该时间点的 sum+count”
+    // 原始版本：values 里每个元素都是 20 个因子（字符串） -> reducer 需要 parse 144 万次
+    // 现在版本：values 里每个元素都是 sum[20] + count -> reducer 只需要处理约 4802 行 key
+    //
     public static class AverageReducer extends Reducer<Text, Text, Text, Text> {
 
         private boolean headerWritten = false;
@@ -289,39 +292,34 @@ public class LobFactorJob {
         protected void reduce(Text key, Iterable<Text> values, Context context)
                 throws IOException, InterruptedException {
 
-            // 第一次写表头：tradeTime,alpha_1,...,alpha_20
             if (!headerWritten) {
                 StringBuilder header = new StringBuilder();
                 header.append("alpha_1");
-                for (int i = 2; i <= 20; i++) {
-                    header.append(',').append("alpha_").append(i);
-                }
+                for (int i = 2; i <= 20; i++) header.append(',').append("alpha_").append(i);
                 context.write(new Text("tradeTime"), new Text(header.toString()));
                 headerWritten = true;
             }
 
-            // sum[i]：累加所有股票在该时刻的第 i 个因子
-            double[] sum = new double[20];
-            int count = 0;
+            double[] totalSum = new double[20];
+            long totalCount = 0;
 
-            // values：形如 "f1,f2,...,f20"
+            // 每个 value 是：sum0,sum1,...,sum19,count
             for (Text v : values) {
                 String[] parts = v.toString().split(",");
-                if (parts.length < 20) continue;
+                if (parts.length < 21) continue;
+
                 for (int i = 0; i < 20; i++) {
-                    sum[i] += Double.parseDouble(parts[i]);
+                    totalSum[i] += Double.parseDouble(parts[i]);
                 }
-                count++;
+                totalCount += Long.parseLong(parts[20]);
             }
 
-            if (count == 0) return;
+            if (totalCount == 0) return;
 
-            // 横截面平均：sum / 股票数
-            for (int i = 0; i < 20; i++) {
-                sum[i] /= count;
-            }
+            //  最后除以总样本数得到横截面均值
+            for (int i = 0; i < 20; i++) totalSum[i] /= totalCount;
 
-            outVal.set(factorsToCsv(sum));
+            outVal.set(factorsToCsv(totalSum));
             context.write(key, outVal);
         }
 
@@ -335,13 +333,19 @@ public class LobFactorJob {
         }
     }
 
+
     // ======================  Driver  ======================
-    /**
-     * Driver：负责配置并提交 Hadoop Job
-     *
-     * args[0]：输入目录（一天的数据目录，里面含 300 个股票文件/子目录）
-     * args[1]：输出目录（必须不存在，否则 Hadoop 报错）
-     */
+    //
+    // ✅ 优化点 1：CombineTextInputFormat 合并小文件
+    // 你的输入是 300 个股票文件（小文件很多），默认 TextInputFormat 往往是“一文件一 map”
+    // 那样每个 mapper 里同一 tradeTime 很难重复出现，in-mapper aggregation 聚合不起来
+    //
+    // 使用 CombineTextInputFormat 后：一个 map task 可以读取多个文件
+    // => 同一 mapper 内会见到很多股票的同一 tradeTime
+    // => aggMap 的 key 数量≈时间点数（几千），而不是行数（百万）
+    //
+    // ✅ 优化点 2：把 split size 设大，让本地模式下 map task 更少
+    // local 模式下 map task 太多会有调度/启动开销，合并成更大的 split 往往更快
 
     public static void main(String[] args) throws Exception {
         if (args.length != 2) {
@@ -355,6 +359,11 @@ public class LobFactorJob {
         conf.set("mapreduce.output.textoutputformat.separator", ",");
 
         Job job = Job.getInstance(conf, "lob-factor-single-job");
+
+        // ✅ 小文件合并输入格式：让一个 mapper 读多个股票文件
+        job.setInputFormatClass(CombineTextInputFormat.class);
+        // ✅ 控制合并后的 split 最大大小（local 模式可设置大一些减少 map 个数）
+        CombineTextInputFormat.setMaxInputSplitSize(job,  1024L * 1024 * 1024);
 
         job.setJarByClass(LobFactorJob.class);
         job.setMapperClass(FactorMapper.class);
@@ -379,6 +388,16 @@ public class LobFactorJob {
         final long t0 = System.nanoTime();
 
         boolean ok = job.waitForCompletion(true);
+
+        org.apache.hadoop.mapreduce.Counters c = job.getCounters();
+        System.out.println("MAP_INPUT_RECORDS=" + c.findCounter(org.apache.hadoop.mapreduce.TaskCounter.MAP_INPUT_RECORDS).getValue());
+        System.out.println("MAP_OUTPUT_RECORDS=" + c.findCounter(org.apache.hadoop.mapreduce.TaskCounter.MAP_OUTPUT_RECORDS).getValue());
+        System.out.println("REDUCE_INPUT_RECORDS=" + c.findCounter(org.apache.hadoop.mapreduce.TaskCounter.REDUCE_INPUT_RECORDS).getValue());
+        System.out.println("SPILLED_RECORDS=" + c.findCounter(org.apache.hadoop.mapreduce.TaskCounter.SPILLED_RECORDS).getValue());
+
+        System.out.println("DBG_IN_WINDOW_LINES=" + c.findCounter("DBG","IN_WINDOW_LINES").getValue());
+        System.out.println("DBG_EMITTED_TIME_KEYS=" + c.findCounter("DBG","EMITTED_TIME_KEYS").getValue());
+
 
         final long t1 = System.nanoTime();
         double elapsedSec = (t1 - t0) / 1_000_000_000.0;
