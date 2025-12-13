@@ -4,10 +4,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.Text;
-import org.apache.hadoop.mapreduce.Job;
-import org.apache.hadoop.mapreduce.Mapper;
-import org.apache.hadoop.mapreduce.Reducer;
-import org.apache.hadoop.mapreduce.TaskCounter;
+import org.apache.hadoop.mapreduce.*;
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 
@@ -62,42 +59,48 @@ public class LobFactorJob {
         }
     }
 
-    // ======================  Mapper  ======================
+    // ======================  Mapper  ===========================================
     // ✅ 优化目标：减少 Map -> Reduce 的中间输出数量（MAP_OUTPUT_RECORDS）
     // 原始版本：每读取一行快照就 context.write 一条  (≈ 144 万条)
     // 优化版本：在 Mapper 内部先按 tradeTime 聚合(sum+count)，最后在 cleanup() 统一输出
-    //          => MAP_OUTPUT_RECORDS 从百万级降到“时间点数量”（你实测 4802）
+    //          => MAP_OUTPUT_RECORDS 从百万级降到“时间点数量”（实测 4802）
     //
     // ✅ 为什么有效：
     // 1) 横截面平均只需要每个 tradeTime 的“总和 + 个数”
     // 2) 不需要把每只股票每一行的 20 因子都发到 reducer
+    // ===========================================================================
+
     public static class FactorMapper extends Mapper<LongWritable, Text, Text, Text> {
 
-        // ✅ 性能测试时建议关闭（每行 Counter.increment 会拖慢）。把它
-        private static final boolean DEBUG = true;
+        // ⚠️ 性能测试时建议关闭（每行 Counter.increment 会拖慢）。
+        private static final boolean DEBUG = false;
 
-        // ✅ code 用 int，避免 substring 得到新 String（同时也更省内存）
+        // code 用 int，避免 substring 得到新 String（同时也更省内存）
         private final Map<Integer, PrevState> prevMap = new HashMap<>(512);
 
-        // ✅ tradeTime -> 聚合(sum[20], count)
+        // ✅ 核心优化 1：tradeTime -> 聚合器(sum[20], count)
+        // 同一个 tradeTime 的多行先累加到 Agg 里，避免大量 context.write
         private final Map<String, Agg> aggMap = new HashMap<>(8192);
 
         private final Text outKey = new Text();
         private final Text outVal = new Text();
 
-        // ✅ 复用 factor 数组：每行填充一次，Agg.add 时把数值加到 sum 里即可
+        // 复用 factor 数组：每行填充一次，Agg.add 时把数值加到 sum 里即可
         private final double[] factor = new double[20];
 
+        // ✅ 聚合器：保存同一 tradeTime 下的 20 因子总和 + 样本数
         private static class Agg {
             final double[] sum = new double[20];
             long count = 0;
 
             void add(double[] f) {
-                // ✅ 只做 20 次加法，不产生新对象
+                //  只做 20 次加法，不产生新对象
                 for (int i = 0; i < 20; i++) sum[i] += f[i];
                 count++;
             }
 
+            // ✅ 输出给 reducer 的 value：sum0,sum1,...,sum19,count
+            // Reducer 再把不同 mapper 的 sum/count 合并即可，不再需要每行的因子明细
             String toCsvSumAndCount() {
                 // 输出：sum0,sum1,...,sum19,count
                 StringBuilder sb = new StringBuilder(20 * 12);
@@ -110,6 +113,7 @@ public class LobFactorJob {
             }
         }
 
+
         @Override
         protected void map(LongWritable key, Text value, Context context)
                 throws IOException, InterruptedException {
@@ -117,14 +121,14 @@ public class LobFactorJob {
             String line = value.toString();
             if (line == null || line.isEmpty()) return;
 
-            // ✅ 比 startsWith("tradingDay") 更快：表头第一列一定是 't'
+            // 跳过表头。比 startsWith("tradingDay") 更快：表头第一列一定是 't'
             if (line.charAt(0) == 't') return;
 
-            // ===========================
-            // ✅ 核心优化 1：不用 split(",")
+            // =========================================================
+            // ✅ 核心优化 2：不用 split(",")
             //  - String.split 是正则，会创建大量 String 对象，CPU + GC 都贵
             //  - 我们只需要有限的列，所以用扫描逗号的方式只解析需要的字段
-            // ===========================
+            // ==========================================================
 
             int hms = 0;          // col 1
             int code = 0;         // col 4
@@ -153,7 +157,6 @@ public class LobFactorJob {
                         // tradeTime（6 位 hhmmss）
                         hms = parseIntFast(line, start, end);
                     } else if (col == 4) {
-                        // code（你数据里是数字：1 / 2 / ...）
                         code = parseIntFast(line, start, end);
                     } else if (col == 12) {
                         tBidVol = parseDoubleFast(line, start, end);
@@ -191,7 +194,7 @@ public class LobFactorJob {
                     col++;
                     start = i + 1;
 
-                    // ✅ 解析到 av5 就停止（col==37 表示已经处理完 0..36）
+                    //  解析到 av5 就停止（col==37 表示已经处理完 0..36）
                     if (col > 36) break;
                 }
             }
@@ -207,7 +210,7 @@ public class LobFactorJob {
             double spread = ap1 - bp1;
             double mid = (ap1 + bp1) / 2.0;
 
-            // ========== 1~16（当前时刻） ==========
+            // ========== 1~16（只用到当前时刻） ==========
             factor[0]  = spread;
             factor[1]  = safeDiv(spread, mid);
             factor[2]  = mid;
@@ -225,7 +228,7 @@ public class LobFactorJob {
             factor[14] = (sumBv / N) - (sumAv / N);
             factor[15] = safeDiv(sumBvOverI - sumAvOverI, sumBvOverI + sumAvOverI);
 
-            // ========== 17~19（上一时刻） ==========
+            // ========== 17~19（需要用到上一时刻） ==========
             PrevState ps = prevMap.get(code);
             double prevAp1, prevMid, prevDepthRatio;
             if (ps == null) {
@@ -253,7 +256,7 @@ public class LobFactorJob {
 
             String timeKey = pad6(hms);
 
-            // ✅ 核心优化 2：in-mapper aggregation（你已经验证能把 MAP_OUTPUT_RECORDS 降到 4802）
+            // ✅ 核心优化 1：in-mapper aggregation（能把 MAP_OUTPUT_RECORDS 降到 4802）
             Agg agg = aggMap.get(timeKey);
             if (agg == null) {
                 agg = new Agg();
@@ -266,11 +269,16 @@ public class LobFactorJob {
 
         @Override
         protected void cleanup(Context context) throws IOException, InterruptedException {
+            // ✅ cleanup() 在一个 Mapper 结束时调用一次
+            // 这里一次性把“每个 tradeTime 的 sum/count”输出，输出条数≈时间点数（几千）
+            // 这就是 MAP_OUTPUT_RECORDS 大幅下降的原因
+
+            // ✅（调试用）输出的 tradeTime key 数量（也就是 aggMap.size()）
             if (DEBUG) context.getCounter("DBG", "EMITTED_TIME_KEYS").increment(aggMap.size());
 
             for (Map.Entry<String, Agg> e : aggMap.entrySet()) {
-                outKey.set(e.getKey());
-                outVal.set(e.getValue().toCsvSumAndCount());
+                outKey.set(e.getKey());                         // tradeTime
+                outVal.set(e.getValue().toCsvSumAndCount());    // sum0,...,sum20,count
                 context.write(outKey, outVal);
             }
 
@@ -279,6 +287,7 @@ public class LobFactorJob {
         }
 
         private static String pad6(int hms) {
+            // hms 形如 93000 -> "093000"
             String s = Integer.toString(hms);
             int n = s.length();
             if (n >= 6) return s;
@@ -288,12 +297,12 @@ public class LobFactorJob {
             return sb.toString();
         }
 
-        // ===========================
+
+        // ========================================
         // ✅ 解析工具：避免 substring + Double.parseDouble 的大量对象创建
         // 数据里基本是整数（价格/量），这里实现一个“切片解析数字”
         // 如遇到小数点，也支持解析（但更慢一点）
-        // ===========================
-
+        // ========================================
         private static int parseIntFast(String s, int start, int end) {
             int i = start;
             boolean neg = false;
@@ -366,6 +375,7 @@ public class LobFactorJob {
 
             // 每个 value 是：sum0,sum1,...,sum19,count
             for (Text v : values) {
+                // 这里仍保留split，因为 in-mapper aggregation 已经大幅减少了reducer需要处理的记录，实测这里的正则对速度影响不大。
                 String[] parts = v.toString().split(",");
                 if (parts.length < 21) continue;
 
@@ -397,15 +407,15 @@ public class LobFactorJob {
 
     // ======================  Driver  ======================
     //
-    // ✅ 优化点 1：CombineTextInputFormat 合并小文件
-    // 你的输入是 300 个股票文件（小文件很多），默认 TextInputFormat 往往是“一文件一 map”
+    // ✅ 优化 1：CombineTextInputFormat 合并小文件
+    // 输入的是 300 个股票文件（小文件很多），默认 TextInputFormat 往往是“一文件一 map”
     // 那样每个 mapper 里同一 tradeTime 很难重复出现，in-mapper aggregation 聚合不起来
     //
     // 使用 CombineTextInputFormat 后：一个 map task 可以读取多个文件
     // => 同一 mapper 内会见到很多股票的同一 tradeTime
     // => aggMap 的 key 数量≈时间点数（几千），而不是行数（百万）
     //
-    // ✅ 优化点 2：把 split size 设大，让本地模式下 map task 更少
+    // ✅ 优化 2：把 split size 设大，让本地模式下 map task 更少
     // local 模式下 map task 太多会有调度/启动开销，合并成更大的 split 往往更快
 
     public static void main(String[] args) throws Exception {
@@ -430,8 +440,7 @@ public class LobFactorJob {
         job.setMapperClass(FactorMapper.class);
         job.setReducerClass(AverageReducer.class);
 
-        // 单 Job，单 Reducer（这样可以方便地写一行表头），符合“不能 jobchain”的要求
-        // ⚠️ 性能上会让 reducer 成为瓶颈（但题目规模可能还可接受）
+        // 单 Job，单 Reducer（这样可以方便地写一行表头）
         job.setNumReduceTasks(1);
 
         job.setMapOutputKeyClass(Text.class);
